@@ -1,0 +1,75 @@
+name: Signed Windows configuration renderer diagnostic
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  renderer:
+    if: github.repository == 'wndsoftware/gateway-releases' && github.repository_id == '1456635236' && github.ref == 'refs/heads/main' && github.run_attempt == 1
+    runs-on: windows-2022
+    timeout-minutes: 6
+    steps:
+      - name: Authenticate, install and probe the signed runtime
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+          DRAFT_ID: "444545398"
+          ASSET_ID: "744587910"
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $releaseJson = gh api "repos/wndsoftware/gateway-releases/releases/$env:DRAFT_ID"
+          if ($LASTEXITCODE -ne 0) { throw 'The repository token could not read the draft.' }
+          $release = $releaseJson | ConvertFrom-Json
+          $asset = @($release.assets | Where-Object { "$($_.id)" -ceq $env:ASSET_ID })
+          if (!$release.draft -or !$release.prerelease -or "$($release.id)" -cne $env:DRAFT_ID -or $asset.Count -ne 1 -or $asset[0].size -ne 16052224) {
+            throw 'The approved asset is missing from the unpublished release.'
+          }
+          $msi = Join-Path $env:RUNNER_TEMP 'wnd-gateway-setup.msi'
+          $curl = Join-Path ([Environment]::GetFolderPath('System')) 'curl.exe'
+          # curl keeps Authorization on the original host when following redirects.
+          & $curl --fail --silent --show-error --location --max-time 90 --proto '=https' --proto-redir '=https' `
+            -H 'Accept: application/octet-stream' -H "Authorization: Bearer $env:GH_TOKEN" `
+            --output $msi "https://api.github.com/repos/wndsoftware/gateway-releases/releases/assets/$env:ASSET_ID"
+          if ($LASTEXITCODE -ne 0) { throw 'The repository token could not fetch the draft asset.' }
+          Remove-Item Env:GH_TOKEN
+          function Assert-SignedFile($Path, $Digest) {
+            if ((Get-FileHash -LiteralPath $Path -Algorithm SHA256).Hash -ine $Digest) { throw 'The asset digest differs from the approved bytes.' }
+            $signature = Get-AuthenticodeSignature -LiteralPath $Path
+            if ($signature.Status -ne 'Valid' -or $signature.SignerCertificate.Thumbprint -ine 'A4D92C21835F23E14DAFEFE4A660E3E398F1E4F7') {
+              throw 'The file publisher differs from the approved WND publisher.'
+            }
+          }
+          Assert-SignedFile $msi '09270a80761f7953f8b3ef021bca3579c76814f09dd43b0dbace6520438a06b8'
+          $system = [Environment]::GetFolderPath('System')
+          $install = Start-Process -FilePath (Join-Path $system 'msiexec.exe') -ArgumentList "/i `"$msi`" /qn /norestart" -Wait -PassThru
+          if ($install.ExitCode -ne 0) { throw 'Signed MSI install failed.' }
+          $runtime = Join-Path ([Environment]::GetFolderPath('ProgramFiles')) 'WND Software\Gateway Setup\staging\1.0.542\wnd-gateway.exe'
+          Assert-SignedFile $runtime 'a628848a6de4330d2a34270e6d68a797b0157cb005ef072b9d7bb224acba9858'
+          $id = [guid]::NewGuid().ToString('N')
+          $start = [Diagnostics.ProcessStartInfo]::new($runtime)
+          $start.UseShellExecute = $false
+          $start.WorkingDirectory = $system
+          $start.RedirectStandardOutput = $true
+          $start.RedirectStandardError = $true
+          $start.Environment.Clear()
+          $start.Environment['SystemRoot'] = Split-Path $system
+          $start.Environment['WINDIR'] = Split-Path $system
+          $start.Environment['PATH'] = $system
+          $start.Environment['PSModulePath'] = Join-Path $system 'WindowsPowerShell\v1.0\Modules'
+          foreach ($arg in @('managed-setup-base-config', '--installation-id', $id)) { $start.ArgumentList.Add($arg) }
+          $process = [Diagnostics.Process]::Start($start)
+          $stdout = $process.StandardOutput.ReadToEndAsync()
+          $stderr = $process.StandardError.ReadToEndAsync()
+          if (!$process.WaitForExit(60000)) { $process.Kill($true); throw 'Renderer timed out.' }
+          $status = '{0:x8}' -f $process.ExitCode
+          "renderer_exit=$($process.ExitCode) renderer_status=0x$status"
+          $rawError = $stderr.GetAwaiter().GetResult()
+          $diagnostics = ($rawError -replace [regex]::Escape($id), '[installation]' -replace [regex]::Escape($env:USERPROFILE), '[profile]') -replace '[^\x20-\x7E\r\n]', ''
+          if ($diagnostics) {
+            $diagnostics.Substring(0, [Math]::Min($diagnostics.Length, 2000)).Split("`n") |
+              ForEach-Object { 'renderer | ' + $_ }
+          }
+          exit $process.ExitCode
