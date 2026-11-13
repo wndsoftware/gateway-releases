@@ -46,30 +46,58 @@ jobs:
           $system = [Environment]::GetFolderPath('System')
           $install = Start-Process -FilePath (Join-Path $system 'msiexec.exe') -ArgumentList "/i `"$msi`" /qn /norestart" -Wait -PassThru
           if ($install.ExitCode -ne 0) { throw 'Signed MSI install failed.' }
-          $runtime = Join-Path ([Environment]::GetFolderPath('ProgramFiles')) 'WND Software\Gateway Setup\staging\1.0.542\wnd-gateway.exe'
-          Assert-SignedFile $runtime 'a628848a6de4330d2a34270e6d68a797b0157cb005ef072b9d7bb224acba9858'
-          $id = [guid]::NewGuid().ToString('N')
-          $start = [Diagnostics.ProcessStartInfo]::new($runtime)
-          $start.UseShellExecute = $false
-          $start.WorkingDirectory = $system
-          $start.RedirectStandardOutput = $true
-          $start.RedirectStandardError = $true
-          $start.Environment.Clear()
-          $start.Environment['SystemRoot'] = Split-Path $system
-          $start.Environment['WINDIR'] = Split-Path $system
-          $start.Environment['PATH'] = $system
-          $start.Environment['PSModulePath'] = Join-Path $system 'WindowsPowerShell\v1.0\Modules'
-          foreach ($arg in @('managed-setup-base-config', '--installation-id', $id)) { $start.ArgumentList.Add($arg) }
-          $process = [Diagnostics.Process]::Start($start)
-          $stdout = $process.StandardOutput.ReadToEndAsync()
-          $stderr = $process.StandardError.ReadToEndAsync()
-          if (!$process.WaitForExit(60000)) { $process.Kill($true); throw 'Renderer timed out.' }
-          $status = '{0:x8}' -f $process.ExitCode
-          "renderer_exit=$($process.ExitCode) renderer_status=0x$status"
-          $rawError = $stderr.GetAwaiter().GetResult()
-          $diagnostics = ($rawError -replace [regex]::Escape($id), '[installation]' -replace [regex]::Escape($env:USERPROFILE), '[profile]') -replace '[^\x20-\x7E\r\n]', ''
-          if ($diagnostics) {
-            $diagnostics.Substring(0, [Math]::Min($diagnostics.Length, 2000)).Split("`n") |
-              ForEach-Object { 'renderer | ' + $_ }
+          $files = [Environment]::GetFolderPath('ProgramFiles')
+          $data = [Environment]::GetFolderPath('CommonApplicationData')
+          $stage = Join-Path $files 'WND Software\Gateway Setup\staging\1.0.542'
+          $helper = Join-Path $stage 'Install-WNDGatewayVirtualService.ps1'
+          $receipt = 'd4665026c41324cf61427b114379dc44c027ef35a314eb3f5ce9c171fb5010ed'
+          if ((Get-FileHash (Join-Path $stage 'release-integrity.json')).Hash -ine $receipt -or
+              (Get-FileHash $helper).Hash -ine '90fde0985dcd7ebc4580c760cf2ba920f1fe8d0c751c4d8f46bca6064f6cc56e') {
+            throw 'The installed helper or receipt differs from approved bytes.'
           }
-          exit $process.ExitCode
+          $runtimeDigest = 'a628848a6de4330d2a34270e6d68a797b0157cb005ef072b9d7bb224acba9858'
+          Assert-SignedFile (Join-Path $stage 'wnd-gateway.exe') $runtimeDigest
+          $id = [guid]::NewGuid().ToString('N')
+          function Invoke-Restricted($Label, $Executable, $Arguments, $Timeout) {
+            $start = [Diagnostics.ProcessStartInfo]::new($Executable)
+            $start.UseShellExecute = $false
+            $start.WorkingDirectory = $system
+            $start.RedirectStandardOutput = $true
+            $start.RedirectStandardError = $true
+            $start.RedirectStandardInput = $true
+            $start.Environment.Clear()
+            $start.Environment['SystemRoot'] = Split-Path $system
+            $start.Environment['WINDIR'] = Split-Path $system
+            $start.Environment['PATH'] = $system
+            $start.Environment['PSModulePath'] = Join-Path $system 'WindowsPowerShell\v1.0\Modules'
+            foreach ($arg in $Arguments) { $start.ArgumentList.Add($arg) }
+            $process = [Diagnostics.Process]::Start($start)
+            $process.StandardInput.Close()
+            $stdout = $process.StandardOutput.ReadToEndAsync()
+            $stderr = $process.StandardError.ReadToEndAsync()
+            if (!$process.WaitForExit($Timeout)) { $process.Kill($true); throw "$Label timed out." }
+            $status = '{0:x8}' -f $process.ExitCode
+            Write-Host "${Label}_exit=$($process.ExitCode) ${Label}_status=0x$status"
+            $rawError = $stderr.GetAwaiter().GetResult()
+            $diagnostics = ($rawError -replace [regex]::Escape($id), '[installation]' -replace [regex]::Escape($env:USERPROFILE), '[profile]') -replace '[^\x20-\x7E\r\n]', ''
+            if ($diagnostics) {
+              $diagnostics.Substring(0, [Math]::Min($diagnostics.Length, 2000)).Split("`n") |
+                ForEach-Object { Write-Host "$Label | $_" }
+            }
+            return $process.ExitCode
+          }
+          $powershell = Join-Path $system 'WindowsPowerShell\v1.0\powershell.exe'
+          $helperArgs = @('-NoLogo', '-NoProfile', '-NonInteractive', '-File', $helper,
+            '-ManagedVersion', '1.0.542', '-ManagedReceiptSha256', $receipt, '-InstallationId', $id,
+            '-ManagedProgramFiles', $files, '-ManagedProgramData', $data)
+          $helperExit = Invoke-Restricted 'helper' $powershell $helperArgs 120000
+          $protected = Join-Path $data 'WND Gateway Protected'
+          $intent = Test-Path -LiteralPath (Join-Path $protected 'config\on-prem-installation.txt') -PathType Leaf
+          $config = Test-Path -LiteralPath (Join-Path $protected 'config\gateway.toml') -PathType Leaf
+          $runtime = Join-Path $files "WND Software\WND Gateway\runtime\$receipt\wnd-gateway.exe"
+          $runtimeExists = Test-Path -LiteralPath $runtime -PathType Leaf
+          "intent=$intent config=$config protected_runtime=$runtimeExists"
+          if (!$runtimeExists) { throw 'The helper did not copy the signed runtime.' }
+          Assert-SignedFile $runtime $runtimeDigest
+          $rendererExit = Invoke-Restricted 'protected_renderer' $runtime @('managed-setup-base-config', '--installation-id', $id) 60000
+          if ($helperExit -ne 0 -or $rendererExit -ne 0) { exit 1 }
