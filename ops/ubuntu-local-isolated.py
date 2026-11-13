@@ -88,11 +88,19 @@ def execute(config, stage, log, source_url, signed_url, license_text):
                                 check=True, timeout=timeout)
         return result.stdout.decode().strip() if capture else None
 
-    require(run(["git", "--no-replace-objects", "rev-parse", "HEAD"], capture=True) == config["sourceSha"],
-            "Private source commit differs")
-    require(run(["git", "--no-replace-objects", "rev-parse", "HEAD^{tree}"], capture=True) == config["sourceTree"],
-            "Private source tree differs")
+    checkout_sha = config.get("qualificationSha", config["sourceSha"])
+    checkout_tree = config.get("qualificationTree", config["sourceTree"])
+    require(run(["git", "--no-replace-objects", "rev-parse", "HEAD"], capture=True) == checkout_sha,
+            "Private checkout commit differs")
+    require(run(["git", "--no-replace-objects", "rev-parse", "HEAD^{tree}"], capture=True) == checkout_tree,
+            "Private checkout tree differs")
+    require(run(["git", "--no-replace-objects", "rev-parse", config["sourceSha"] + "^{tree}"], capture=True)
+            == config["sourceTree"], "Signed product tree differs")
     require(not run(["git", "status", "--porcelain=v1", "--untracked-files=all"], capture=True), "Dirty private source")
+    if config["mode"] == "qualify":
+        run(["python3", "-c", "import sys;sys.path.insert(0,'tools/release');"
+             "from gateway_ubuntu_local_profile import verify_qualification_revision;"
+             "verify_qualification_revision('.',sys.argv[1],sys.argv[2])", config["sourceSha"], checkout_sha])
     if config["mode"] == "build":
         run(["bash", "tools/ci/apt-install.sh", "libssl-dev", "pkg-config", "binutils"])
         commands = [
@@ -129,6 +137,11 @@ def main():
     config = json.loads(os.environ.pop("WND_OPERATION"))
     require(config["mode"] in {"build", "qualify"}, "Invalid operation")
     require(all(re.fullmatch(r"[0-9a-f]{40}", config[key]) for key in ("sourceSha", "sourceTree")), "Invalid source pins")
+    if config["mode"] == "qualify":
+        require(all(re.fullmatch(r"[0-9a-f]{40}", config[key])
+                    for key in ("qualificationSha", "qualificationTree")), "Invalid qualification pins")
+    else:
+        require("qualificationSha" not in config and "qualificationTree" not in config, "Build must use the product source")
     require(os.environ["GITHUB_REPOSITORY"] == REPO and os.environ["GITHUB_REPOSITORY_ID"] == "1456635236"
             and os.environ["GITHUB_REF"] == "refs/heads/main" and os.environ["GITHUB_RUN_ATTEMPT"] == "1",
             "Invalid runner identity")
@@ -157,6 +170,8 @@ def main():
     record = {"status": status, "mode": config["mode"], "repository": REPO,
               "workflowRevision": os.environ["GITHUB_SHA"], "runId": run_id,
               "sourceRevision": config["sourceSha"], "sourceTree": config["sourceTree"]}
+    if config["mode"] == "qualify":
+        record.update(qualificationRevision=config["qualificationSha"], qualificationTree=config["qualificationTree"])
     (output / "operation.json").write_text(json.dumps(record, indent=2) + "\n")
     plain = stage / "output.tar.gz"
     with tarfile.open(plain, "w:gz") as tar:
