@@ -1,0 +1,46 @@
+name: Isolated Ubuntu release operation
+on:
+  workflow_dispatch:
+    inputs:
+      workflow_sha:
+        description: Exact reviewed public workflow revision
+        required: true
+        type: string
+      operation:
+        description: Reviewed JSON operation and immutable input pins
+        required: true
+        type: string
+permissions:
+  contents: write
+concurrency:
+  group: ubuntu-local-isolated
+  cancel-in-progress: false
+jobs:
+  ubuntu:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    steps:
+      - name: Admit exact operator dispatch
+        env:
+          APPROVED_WORKFLOW: ${{ inputs.workflow_sha }}
+          ENABLED: ${{ vars.WND_UBUNTU_ISOLATED }}
+        run: |
+          set -euo pipefail
+          [[ "$GITHUB_REPOSITORY" == wndsoftware/gateway-releases && "$GITHUB_REPOSITORY_ID" == 1456635236 ]]
+          [[ "$GITHUB_REF" == refs/heads/main && "$GITHUB_EVENT_NAME" == workflow_dispatch && "$GITHUB_RUN_ATTEMPT" == 1 ]]
+          [[ "$ENABLED" == enabled && "$APPROVED_WORKFLOW" =~ ^[0-9a-f]{40}$ && "$APPROVED_WORKFLOW" == "$GITHUB_SHA" ]]
+      - uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@a0853c24544627f65ddf259abe73b1d18a591444
+        with:
+          node-version: '22'
+          package-manager-cache: false
+      - name: Execute and return encrypted private output
+        env:
+          WND_OPERATION: ${{ inputs.operation }}
+          WND_SOURCE_URL: ${{ secrets.WND_UBUNTU_SOURCE_URL }}
+          WND_SIGNED_URL: ${{ secrets.WND_UBUNTU_SIGNED_URL }}
+          WND_CI_LICENSE: ${{ secrets.WND_UBUNTU_CI_LICENSE }}
+          GH_TOKEN: ${{ github.token }}
+        run: python3 ops/ubuntu-local-isolated.py
