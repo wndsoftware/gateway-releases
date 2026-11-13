@@ -1,0 +1,51 @@
+name: Windows PowerShell child input diagnostic
+
+on:
+  workflow_dispatch:
+
+permissions: {}
+
+jobs:
+  stdin:
+    if: github.repository == 'wndsoftware/gateway-releases' && github.repository_id == '1456635236' && github.ref == 'refs/heads/main' && github.run_attempt == 1
+    runs-on: windows-2022
+    timeout-minutes: 3
+    steps:
+      - name: Compare synthetic child input bytes
+        shell: powershell
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $python = (Get-Command python -CommandType Application).Source
+          $expected = '73616d706c652d41534349490a'
+          $encoding = [Console]::InputEncoding
+          function Test-ChildInput([bool]$UseExactBytes) {
+            $start = [Diagnostics.ProcessStartInfo]::new($python, '-c "import sys; print(sys.stdin.buffer.read().hex())"')
+            $start.UseShellExecute = $false
+            $start.RedirectStandardInput = $true
+            $start.RedirectStandardOutput = $true
+            try {
+              if ($UseExactBytes) { [Console]::InputEncoding = [Text.UTF8Encoding]::new($false) }
+              $process = [Diagnostics.Process]::Start($start)
+            } finally {
+              [Console]::InputEncoding = $encoding
+            }
+            try {
+              if ($UseExactBytes) {
+                $bytes = [Text.Encoding]::ASCII.GetBytes("sample-ASCII`n")
+                $process.StandardInput.BaseStream.Write($bytes, 0, $bytes.Length)
+              } else {
+                $process.StandardInput.Write("sample-ASCII`n")
+              }
+              $process.StandardInput.Close()
+              $output = $process.StandardOutput.ReadToEnd().Trim()
+              if (!$process.WaitForExit(10000) -or $process.ExitCode -ne 0) { throw 'Synthetic child failed.' }
+              return $output
+            } finally {
+              $process.Dispose()
+            }
+          }
+          "PowerShell=$($PSVersionTable.PSVersion) console_input=$($encoding.WebName)"
+          $legacy = Test-ChildInput $false
+          $exact = Test-ChildInput $true
+          "legacy=$legacy exact=$exact expected=$expected"
+          if ($exact -cne $expected) { throw 'Exact-byte input did not match.' }
