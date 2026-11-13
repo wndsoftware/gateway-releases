@@ -99,5 +99,27 @@ jobs:
           "intent=$intent config=$config protected_runtime=$runtimeExists"
           if (!$runtimeExists) { throw 'The helper did not copy the signed runtime.' }
           Assert-SignedFile $runtime $runtimeDigest
+          # Compare the native call in Windows PowerShell 5.1 with direct
+          # process creation, with the same file and disposable identity.
+          $rendererScript = @'
+          param([string]$Candidate,[string]$Installation)
+          $ErrorActionPreference = 'Stop'
+          [Console]::Error.WriteLine("native_before=$LASTEXITCODE")
+          try {
+            $rendered = & $Candidate managed-setup-base-config --installation-id $Installation
+            $native = $LASTEXITCODE
+            [Console]::Error.WriteLine("native_after=$native lines=$(@($rendered).Count)")
+            if ($null -eq $native) { exit 125 }
+            exit $native
+          } catch {
+            [Console]::Error.WriteLine("native_error_id=$($_.FullyQualifiedErrorId)")
+            [Console]::Error.WriteLine($_.Exception.Message)
+            exit 126
+          }
+          '@
+          $probePath = Join-Path $env:RUNNER_TEMP 'probe-powershell-renderer.ps1'
+          Set-Content -LiteralPath $probePath -Value $rendererScript -Encoding ascii
+          $nativeArgs = @('-NoLogo','-NoProfile','-NonInteractive','-File',$probePath,$runtime,$id)
+          $nativeExit = Invoke-Restricted 'powershell_renderer' $powershell $nativeArgs 60000
           $rendererExit = Invoke-Restricted 'protected_renderer' $runtime @('managed-setup-base-config', '--installation-id', $id) 60000
-          if ($helperExit -ne 0 -or $rendererExit -ne 0) { exit 1 }
+          if ($helperExit -ne 0 -or $nativeExit -ne 0 -or $rendererExit -ne 0) { exit 1 }
